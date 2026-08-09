@@ -7,6 +7,26 @@ import time as t
 from pathlib import Path
 from tools import FileTools
 
+art = r"""
++===============================================================+
+|                                                               |
+|      __                 __   ___    ____          .--.        |
+|     / /  ___  ____ ___ / /  / _ |  /  _/         |o_o |       |
+|    / /__/ _ \/ __/ _ `/ /  / __ | _/ /          <|:_/ |       |
+|   /____/\___/\__/\_,_/_/  /_/ |_|/___/         //   \ \       |
+|              A S S I S T A N T                (|     | )      |
+|      [ local ]  [ ollama ]  [ offline ]      /'\_   _/`\      |
+|                                              \___)=(___/      |
+|                                                               |
+|      create | read | write | rename | delete                  |
+|                                                               |
++===============================================================+
+"""
+
+
+
+
+
 
 
 file_tools = FileTools()
@@ -388,6 +408,7 @@ def stop_server():
         return
 
 def main():
+    print(art)
     if not check_if_model_is_installed():
         return
     while True:
