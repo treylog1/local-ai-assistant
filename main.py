@@ -1,9 +1,10 @@
 import json
-from os import name
+import os
 import subprocess
 import questionary as q
 import requests as r
 import time as t
+from pathlib import Path
 from tools import FileTools
 
 
@@ -13,15 +14,17 @@ file_tools = FileTools()
 
 SERVER_URL = "http://localhost:11434"
 MODEL = "qwen3:4b"
-OLLAMA_PATH = r"C:\Users\treyl\AppData\Local\Programs\Ollama\ollama.exe"
+OLLAMA_PATH = str(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Ollama" / "ollama.exe")
 prompt = """
-    you are a local ai assistant for common tasks around the desktop.
-    you will be given specific tools for tasks around the desktop.
-    you will not do anything destructive.
-    you will not do anything that might hurt the users information.
-    you will use the tools provided to you when needed to complete the task.
-    after a tool returns success, do not call the same tool again; reply to the user with the result.
+You are a local desktop assistant. Help the user with everyday file tasks using only the tools provided.
 
+Rules:
+- Prefer tools over guessing. Use them when you need to create, read, write, rename, or delete a file.
+- Be careful with the user's files. Do not delete or overwrite anything unless they clearly asked for it.
+- File deletion requires the user's confirmation in the app. If they cancel, acknowledge that and stop.
+- After a tool returns success, do not call that same tool again for the same action. Reply with a short, clear result.
+- If a tool fails, explain the error briefly and suggest a next step.
+- Keep answers concise and practical.
 """
 
 tool_json = [
@@ -145,14 +148,35 @@ tool_json = [
 
 
 
-
 def check_if_model_is_installed():
-    test = subprocess.run(
-        ["ollama", "list"],
-        check=True,
-        capture_output=True,
-        text=True
-    )
+    # Check if ollama is installed
+    try:
+        version_check = subprocess.run(
+            [OLLAMA_PATH, "--version"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+    except FileNotFoundError:
+        print(f"Could not find Ollama at:\n  {OLLAMA_PATH}")
+        print("Install Ollama from https://ollama.com, then restart this app.")
+        return False
+    except subprocess.CalledProcessError as e:
+        print(f"Ollama failed to start: {e}")
+        print("Check your Ollama install and try again.")
+        return False
+
+    # Now check if the model is installed
+    try:
+        test = subprocess.run(
+            [OLLAMA_PATH, "list"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Could not list models: {e}")
+        return False
 
     lines = test.stdout.splitlines()
 
@@ -164,25 +188,26 @@ def check_if_model_is_installed():
             models.append(model_name)
 
     if MODEL in models:
-        print(f"Model {MODEL} is installed")
+        print(f"Ready: {MODEL} is available.")
         return True
     else:
-        print(f"Model {MODEL} is not installed")
+        print(f"Required model not found: {MODEL}")
+        print(f"Run this command, then restart:\n  ollama pull {MODEL}")
         return False
   
 
 
 
 
-message = []
+message = [{"role": "system", "content": prompt.strip()}]
 def message_to_model():
     if check_server_status() == False:
-        print("Server is not running")
+        print("Ollama is not running. Start it from the menu first.")
         return
 
     else:
         while True:
-            user_message = input("what do you need: ")
+            user_message = input("Ask something (or type exit): ")
             message.append({"role": "user", "content": user_message})
             if user_message == "exit":
                 return
@@ -191,7 +216,6 @@ def message_to_model():
                     response = r.post(f"{SERVER_URL}/api/chat", json={
                         "model": MODEL,
                         "messages": message,
-                        "system": prompt,
                         "stream": False,
                         "think": True,
                         "tool_choice": "auto",
@@ -216,16 +240,46 @@ def message_to_model():
                                 arguments = json.loads(arguments)
 
                             if hasattr(file_tools, tool_name):
-                                tool_response = getattr(file_tools, tool_name)(**arguments)
-                                print(f"Tool called: {tool_name} with arguments {arguments}")
-                                print(f"Result from tool '{tool_name}': {tool_response}")
-                                message.append({
-                                    "role": "tool",
-                                    "name": tool_name,
-                                    "content": str(tool_response),
-                                })
+                                # Check if the tool is deleting_file before proceeding
+                                if tool_name == "deleting_file":
+                                    confirm = q.confirm(
+                                        "Delete this file? This cannot be undone.",
+                                        default=False
+                                    ).ask()
+                                    if not confirm:
+                                        print("Deletion cancelled.")
+                                        tool_response = {
+                                            "status": "cancelled",
+                                            "message": "File deletion has been cancelled by the user."
+                                        }
+                                        message.append({
+                                            "role": "tool",
+                                            "name": tool_name,
+                                            "content": str(tool_response),
+                                        })
+                                    else:
+                                        tool_response = getattr(file_tools, tool_name)(**arguments)
+                                        print(f"Running: {tool_name}")
+                                        print(f"Args: {arguments}")
+                                        print(f"Result: {tool_response}")
+                                        message.append({
+                                            "role": "tool",
+                                            "name": tool_name,
+                                            "content": str(tool_response),
+                                        })
+                                else:
+                                    tool_response = getattr(file_tools, tool_name)(**arguments)
+                                    print(f"Running: {tool_name}")
+                                    print(f"Args: {arguments}")
+                                    print(f"Result: {tool_response}")
+                                    message.append({
+                                        "role": "tool",
+                                        "name": tool_name,
+                                        "content": str(tool_response),
+                                    })
+                         
                             else:
-                                print(f"Tool '{tool_name}' not found in the provided file_tools instance.")
+                                print(f"Skipped unknown tool: {tool_name}")
                                 message.append({
                                     "role": "tool",
                                     "name": tool_name,
@@ -235,23 +289,21 @@ def message_to_model():
                         response = r.post(f"{SERVER_URL}/api/chat", json={
                             "model": MODEL,
                             "messages": message,
-                            "system": prompt,
                             "stream": False,
                             "think": True,
                             "tool_choice": "auto",
                             "tools": tool_json,
                         })
                         data = response.json()
-                        print(f"New response from model: {data.get('message', {}).get('content', '')}")
 
                     # Final assistant reply (no tool_calls), including when no tools were used
                     if "message" in data:
                         message.append(data["message"])
                         if data["message"].get("content"):
-                            print(data["message"]["content"])
+                            print(f"Assistant: {data['message']['content']}")
 
                 except r.exceptions.RequestException as e:
-                    print(f"you got an error {e}")
+                    print(f"Could not reach Ollama: {e}")
                     return
 
     
@@ -269,7 +321,7 @@ def warm_model():
         })
 
         if response.status_code == 200:
-            print("Model is warmed up")
+            print("Model ready.")
             return True
 
 
@@ -283,7 +335,7 @@ def start_server():
     try:
         response = r.get("http://localhost:11434/api/version")
         if response.status_code == 200:
-            print("Server is already running")
+            print("Ollama is already running.")
             return True
     except Exception as e:
         if e:
@@ -292,14 +344,10 @@ def start_server():
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            print("Server is starting...")
+            print("Starting Ollama...")
             t.sleep(20)
             if check_server_status() == True:
-                if check_if_model_is_installed() == False:
-                    print("Model is not installed")
-                    return False
-                else:
-                    print("warming up model...")
+                print("Loading model...")
                 warm_model()
             return True
 
@@ -330,35 +378,47 @@ def stop_server():
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
-            print("Server is stopped")
+            print("Ollama stopped.")
             return
         except Exception as e:
-            print(f"Error stopping server: {e}")
+            print(f"Could not stop Ollama: {e}")
             
     else:
-        print("server is not running")
+        print("Ollama is not running.")
         return
 
 def main():
+    if not check_if_model_is_installed():
+        return
     while True:
-        action = q.select("What do you want to do?", choices=["Start Server", "Stop Server", "Check Server Status", "what is your task", "Exit", "exit without stoping server"]).ask()
-        if action == "Start Server":
+        action = q.select(
+            "What would you like to do?",
+            choices=[
+                "Start Ollama",
+                "Stop Ollama",
+                "Check Status",
+                "Chat",
+                "Exit and Stop Ollama",
+                "Exit (Keep Ollama Running)",
+            ],
+        ).ask()
+        if action == "Start Ollama":
             start_server()
-        elif action == "Stop Server":
+        elif action == "Stop Ollama":
             stop_server()
-        elif action == "what is your task":
+        elif action == "Chat":
             message_to_model()
 
-        elif action == "Check Server Status":
+        elif action == "Check Status":
             if check_server_status() == True:
-                print("Server is running")
+                print("Ollama is running.")
             else:
-                print("Server is not running")
-        elif action == "Exit":
-            print("Stoping server...")
+                print("Ollama is not running.")
+        elif action == "Exit and Stop Ollama":
+            print("Stopping Ollama...")
             stop_server()
             break
-        elif action == "exit without stoping server":
+        elif action == "Exit (Keep Ollama Running)":
             break
 if __name__ == "__main__":
     main()
