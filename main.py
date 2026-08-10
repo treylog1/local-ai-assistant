@@ -37,6 +37,9 @@ file_tools = FileTools()
 SERVER_URL = "http://localhost:11434"
 MODEL = "qwen3:4b"
 OLLAMA_PATH = str(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Ollama" / "ollama.exe")
+REQUEST_TIMEOUT = 120  # chat / generate
+STATUS_TIMEOUT = 5     # version / health checks
+TOOL_CALL_LIMIT = 8
 prompt = """
 You are a local desktop assistant. Help the user with everyday file tasks using only the tools provided.
 
@@ -278,151 +281,186 @@ def check_if_model_is_installed():
 
 message = [{"role": "system", "content": prompt.strip()}]
 def message_to_model():
-    tool_call_count = 0
     if check_server_status() == False:
         print("Ollama is not running. Start it from the menu first.")
         return
 
-    else:
-        while True:
-            user_message = input("Ask something (or type exit): ")
-            message.append({"role": "user", "content": user_message})
-            if user_message == "exit":
-                return
-            else:
-                try:
-                    response = r.post(f"{SERVER_URL}/api/chat", json={
+    while True:
+        user_message = input("Ask something (or type exit): ")
+        message.append({"role": "user", "content": user_message})
+        if user_message == "exit":
+            return
+
+        # Fresh budget for each user prompt
+        tool_call_count = 0
+        try:
+            response = r.post(
+                f"{SERVER_URL}/api/chat",
+                json={
+                    "model": MODEL,
+                    "messages": message,
+                    "stream": False,
+                    # Keep think on so Ollama puts reasoning in message.thinking
+                    # (think=false spills that text into message.content for qwen3).
+                    "think": True,
+                    "tool_choice": "auto",
+                    "tools": tool_json,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            data = response.json()
+            tool_limit_reached = False
+
+            # Tool loop: assistant(tool_calls) -> tool results -> model again
+            while (
+                "message" in data
+                and data["message"].get("tool_calls")
+                and not tool_limit_reached
+            ):
+                # Keep the assistant turn without thinking traces
+                message.append(assistant_message_for_history(data["message"]))
+                tool_calls = data["message"]["tool_calls"]
+
+                for index, tool_call in enumerate(tool_calls):
+                    if tool_call_count >= TOOL_CALL_LIMIT:
+                        print(
+                            f"Tool call limit reached for this user message "
+                            f"({TOOL_CALL_LIMIT}). Stopping further tools."
+                        )
+                        limit_payload = {
+                            "status": "limit_exceeded",
+                            "message": (
+                                f"Tool call limit of {TOOL_CALL_LIMIT} has been "
+                                "reached. Further actions have been stopped."
+                            ),
+                        }
+                        # Reply to this call and any remaining ones so history stays valid
+                        for remaining in tool_calls[index:]:
+                            message.append({
+                                "role": "tool",
+                                "name": remaining["function"]["name"],
+                                "content": str(limit_payload),
+                            })
+                        tool_limit_reached = True
+                        break
+
+                    tool_name = tool_call["function"]["name"]
+                    arguments = tool_call["function"]["arguments"]
+                    if isinstance(arguments, str):
+                        arguments = json.loads(arguments)
+
+                    if hasattr(file_tools, tool_name):
+                        if tool_name == "deleting_file":
+                            confirm = q.confirm(
+                                "Delete this file? This cannot be undone.",
+                                default=False
+                            ).ask()
+                            if not confirm:
+                                print("Deletion cancelled.")
+                                tool_response = {
+                                    "status": "cancelled",
+                                    "message": "File deletion has been cancelled by the user."
+                                }
+                            else:
+                                tool_response = getattr(file_tools, tool_name)(**arguments)
+                                print(f"Running: {tool_name}")
+                                print(f"Args: {arguments}")
+                                print(f"Result: {tool_response}")
+                            message.append({
+                                "role": "tool",
+                                "name": tool_name,
+                                "content": str(tool_response),
+                            })
+                        else:
+                            tool_response = getattr(file_tools, tool_name)(**arguments)
+                            print(f"Running: {tool_name}")
+                            print(f"Args: {arguments}")
+                            print(f"Result: {tool_response}")
+                            message.append({
+                                "role": "tool",
+                                "name": tool_name,
+                                "content": str(tool_response),
+                            })
+                    else:
+                        print(f"Skipped unknown tool: {tool_name}")
+                        message.append({
+                            "role": "tool",
+                            "name": tool_name,
+                            "content": str({
+                                "status": "error",
+                                "message": f"Unknown tool '{tool_name}'",
+                            }),
+                        })
+                    tool_call_count += 1
+
+                if tool_limit_reached:
+                    break
+
+                response = r.post(
+                    f"{SERVER_URL}/api/chat",
+                    json={
                         "model": MODEL,
                         "messages": message,
                         "stream": False,
                         "think": True,
                         "tool_choice": "auto",
-                        "tools": tool_json
-                    })
-                    
-                    data = response.json()
+                        "tools": tool_json,
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
+                data = response.json()
 
-                    # Tool loop: assistant(tool_calls) -> tool results -> model again
-                    while (
-                        "message" in data
-                        and data["message"].get("tool_calls")
-                    ):
-                        # Keep the assistant turn without thinking traces
-                        message.append(assistant_message_for_history(data["message"]))
+            # After a hard stop, ask once for a short summary (no more tools)
+            if tool_limit_reached:
+                response = r.post(
+                    f"{SERVER_URL}/api/chat",
+                    json={
+                        "model": MODEL,
+                        "messages": message,
+                        "stream": False,
+                        "think": True,
+                        "tool_choice": "none",
+                        "tools": tool_json,
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
+                data = response.json()
 
-                        # Run every tool from this turn, then ask the model once
-                        for tool_call in data["message"]["tool_calls"]:
-                            if tool_call_count > 8:
-                                print("Tool call limit exceeded for this user message. Limit is 8 tools per step.")
-                                tool_response = {
-                                    "status": "limit_exceeded",
-                                    "message": "Tool call limit of 8 has been reached. Further actions have been stopped."
-                                }
-                                message.append({
-                                    "role": "tool",
-                                    "name": tool_call["function"]["name"],
-                                    "content": str(tool_response),
-                                })
-                                break  # stop processing more tool calls
-                            tool_name = tool_call["function"]["name"]
-                            arguments = tool_call["function"]["arguments"]
-                            if isinstance(arguments, str):
-                                arguments = json.loads(arguments)
+            # Final assistant reply (no tool_calls), including when no tools were used
+            if "message" in data:
+                cleaned = assistant_message_for_history(data["message"])
+                reply = cleaned.get("content") or ""
 
-                            if hasattr(file_tools, tool_name):
-                                # Check if the tool is deleting_file before proceeding
-                                if tool_name == "deleting_file":
-                                    confirm = q.confirm(
-                                        "Delete this file? This cannot be undone.",
-                                        default=False
-                                    ).ask()
-                                    if not confirm:
-                                        print("Deletion cancelled.")
-                                        tool_response = {
-                                            "status": "cancelled",
-                                            "message": "File deletion has been cancelled by the user."
-                                        }
-                                        message.append({
-                                            "role": "tool",
-                                            "name": tool_name,
-                                            "content": str(tool_response),
-                                        })
-                                    else:
-                                        tool_response = getattr(file_tools, tool_name)(**arguments)
-                                        print(f"Running: {tool_name}")
-                                        print(f"Args: {arguments}")
-                                        print(f"Result: {tool_response}")
-                                        message.append({
-                                            "role": "tool",
-                                            "name": tool_name,
-                                            "content": str(tool_response),
-                                        })
-                                else:
-                                    tool_response = getattr(file_tools, tool_name)(**arguments)
-                                    print(f"Running: {tool_name}")
-                                    print(f"Args: {arguments}")
-                                    print(f"Result: {tool_response}")
-                                    message.append({
-                                        "role": "tool",
-                                        "name": tool_name,
-                                        "content": str(tool_response),
-                                    })
-                            else:
-                                print(f"Skipped unknown tool: {tool_name}")
-                                message.append({
-                                    "role": "tool",
-                                    "name": tool_name,
-                                    "content": str({"status": "error", "message": f"Unknown tool '{tool_name}'"}),
-                                })
-                            tool_call_count += 1
-                 
+                if not reply:
+                    for prior in reversed(message):
+                        if prior.get("role") != "tool" or not prior.get("content"):
+                            continue
+                        try:
+                            parsed = (
+                                ast.literal_eval(prior["content"])
+                                if isinstance(prior["content"], str)
+                                else prior["content"]
+                            )
+                        except (SyntaxError, ValueError):
+                            continue
+                        if isinstance(parsed, dict) and parsed.get("message"):
+                            reply = str(parsed["message"])
+                            break
 
-                        response = r.post(f"{SERVER_URL}/api/chat", json={
-                            "model": MODEL,
-                            "messages": message,
-                            "stream": False,
-                            "think": True,
-                            "tool_choice": "auto",
-                            "tools": tool_json,
-                        })
-                        data = response.json()
+                cleaned["content"] = reply
+                message.append(cleaned)
+                if reply:
+                    print(f"Assistant: {reply}")
 
-                    # Final assistant reply (no tool_calls), including when no tools were used
-                    if "message" in data:
-                        # Prefer content; never print message.thinking
-                        cleaned = assistant_message_for_history(data["message"])
-                        reply = cleaned.get("content") or ""
-
-                        # If the model only thought and left no final text, fall back
-                        # to the latest tool result message so the user still gets a reply.
-                        if not reply:
-                            for prior in reversed(message):
-                                if prior.get("role") != "tool" or not prior.get("content"):
-                                    continue
-                                try:
-                                    parsed = (
-                                        ast.literal_eval(prior["content"])
-                                        if isinstance(prior["content"], str)
-                                        else prior["content"]
-                                    )
-                                except (SyntaxError, ValueError):
-                                    continue
-                                if isinstance(parsed, dict) and parsed.get("message"):
-                                    reply = str(parsed["message"])
-                                    break
-
-                        cleaned["content"] = reply
-                        message.append(cleaned)
-                        if reply:
-                            print(f"Assistant: {reply}")
-
-                except r.exceptions.RequestException as e:
-                    print(f"Could not reach Ollama: {e}")
-                    return
-
-    
-             
-
+        except r.exceptions.Timeout:
+            print(
+                f"Ollama timed out after {REQUEST_TIMEOUT}s. "
+                "Is the model loaded and responding?"
+            )
+        except r.exceptions.RequestException as e:
+            print(f"Could not reach Ollama: {e}")
+            return
 
 
 
@@ -432,7 +470,7 @@ def warm_model():
         "prompt": "Hello, world!",
         "stream": False,
         "think": False,
-        })
+        }, timeout=REQUEST_TIMEOUT)
 
         if response.status_code == 200:
             print("Model ready.")
@@ -447,7 +485,7 @@ def warm_model():
 
 def start_server():
     try:
-        response = r.get("http://localhost:11434/api/version")
+        response = r.get("http://localhost:11434/api/version", timeout=STATUS_TIMEOUT)
         if response.status_code == 200:
             print("Ollama is already running.")
             return True
@@ -469,7 +507,7 @@ def start_server():
 
 def check_server_status():
     try:
-        response = r.get("http://localhost:11434/api/version")
+        response = r.get("http://localhost:11434/api/version", timeout=STATUS_TIMEOUT)
         if response.status_code == 200:
             return True
     except Exception as e:
