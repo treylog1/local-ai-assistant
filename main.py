@@ -1,5 +1,7 @@
+import ast
 import json
 import os
+import re
 import subprocess
 import questionary as q
 import requests as r
@@ -41,10 +43,12 @@ You are a local desktop assistant. Help the user with everyday file tasks using 
 Rules:
 - Prefer tools over guessing. Use them when you need to create, read, write, rename, or delete a file.
 - Be careful with the user's files. Do not delete or overwrite anything unless they clearly asked for it.
-- File deletion requires the user's confirmation in the app. If they cancel, acknowledge that and stop.
+- For deletion: call deleting_file. The app will ask the user to confirm. Do not ask for confirmation in chat yourself.
+- If the user cancels deletion, acknowledge that briefly and stop.
 - After a tool returns success, do not call that same tool again for the same action. Reply with a short, clear result.
 - If a tool fails, explain the error briefly and suggest a next step.
-- Keep answers concise and practical.
+- Reply with short user-facing text only. Never narrate your reasoning, rules, or internal analysis.
+- Never use \\boxed{}, LaTeX, or roleplay as "the assistant should...".
 """
 
 tool_json = [
@@ -168,6 +172,59 @@ tool_json = [
 
 
 
+def clean_assistant_content(content: str) -> str:
+    """Hide model reasoning; return only the user-facing reply."""
+    if not content:
+        return ""
+
+    text = content
+
+    # Full think / thinking blocks
+    text = re.sub(
+        r"<think>.*?</think>",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(
+        r"<thinking>.*?</thinking>",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    # With think=false, Ollama often drops the opening tag and leaves
+    # reasoning + a trailing </think>. Keep only text after the last closer.
+    closer = re.search(r"</think\s*>|</thinking\s*>", text, flags=re.IGNORECASE)
+    if closer:
+        text = text[closer.end():]
+
+    # Drop any leftover open tags if the closer never arrived
+    text = re.sub(r"<think\s*>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<thinking\s*>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Qwen-style final answers sometimes land only inside \boxed{...}
+    boxed = re.findall(
+        r"\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}",
+        text,
+    )
+    if boxed:
+        return boxed[-1].strip()
+
+    text = re.sub(r"\$\$\s*", "", text)
+    return text.strip()
+
+
+def assistant_message_for_history(msg: dict) -> dict:
+    cleaned = {
+        "role": msg.get("role", "assistant"),
+        "content": clean_assistant_content(msg.get("content") or ""),
+    }
+    if msg.get("tool_calls"):
+        cleaned["tool_calls"] = msg["tool_calls"]
+    return cleaned
+
+
 def check_if_model_is_installed():
     # Check if ollama is installed
     try:
@@ -221,6 +278,7 @@ def check_if_model_is_installed():
 
 message = [{"role": "system", "content": prompt.strip()}]
 def message_to_model():
+    tool_call_count = 0
     if check_server_status() == False:
         print("Ollama is not running. Start it from the menu first.")
         return
@@ -249,11 +307,23 @@ def message_to_model():
                         "message" in data
                         and data["message"].get("tool_calls")
                     ):
-                        # Keep the full assistant turn (includes tool_calls)
-                        message.append(data["message"])
+                        # Keep the assistant turn without thinking traces
+                        message.append(assistant_message_for_history(data["message"]))
 
                         # Run every tool from this turn, then ask the model once
                         for tool_call in data["message"]["tool_calls"]:
+                            if tool_call_count > 8:
+                                print("Tool call limit exceeded for this user message. Limit is 8 tools per step.")
+                                tool_response = {
+                                    "status": "limit_exceeded",
+                                    "message": "Tool call limit of 8 has been reached. Further actions have been stopped."
+                                }
+                                message.append({
+                                    "role": "tool",
+                                    "name": tool_call["function"]["name"],
+                                    "content": str(tool_response),
+                                })
+                                break  # stop processing more tool calls
                             tool_name = tool_call["function"]["name"]
                             arguments = tool_call["function"]["arguments"]
                             if isinstance(arguments, str):
@@ -297,7 +367,6 @@ def message_to_model():
                                         "name": tool_name,
                                         "content": str(tool_response),
                                     })
-                         
                             else:
                                 print(f"Skipped unknown tool: {tool_name}")
                                 message.append({
@@ -305,6 +374,8 @@ def message_to_model():
                                     "name": tool_name,
                                     "content": str({"status": "error", "message": f"Unknown tool '{tool_name}'"}),
                                 })
+                            tool_call_count += 1
+                 
 
                         response = r.post(f"{SERVER_URL}/api/chat", json={
                             "model": MODEL,
@@ -318,9 +389,32 @@ def message_to_model():
 
                     # Final assistant reply (no tool_calls), including when no tools were used
                     if "message" in data:
-                        message.append(data["message"])
-                        if data["message"].get("content"):
-                            print(f"Assistant: {data['message']['content']}")
+                        # Prefer content; never print message.thinking
+                        cleaned = assistant_message_for_history(data["message"])
+                        reply = cleaned.get("content") or ""
+
+                        # If the model only thought and left no final text, fall back
+                        # to the latest tool result message so the user still gets a reply.
+                        if not reply:
+                            for prior in reversed(message):
+                                if prior.get("role") != "tool" or not prior.get("content"):
+                                    continue
+                                try:
+                                    parsed = (
+                                        ast.literal_eval(prior["content"])
+                                        if isinstance(prior["content"], str)
+                                        else prior["content"]
+                                    )
+                                except (SyntaxError, ValueError):
+                                    continue
+                                if isinstance(parsed, dict) and parsed.get("message"):
+                                    reply = str(parsed["message"])
+                                    break
+
+                        cleaned["content"] = reply
+                        message.append(cleaned)
+                        if reply:
+                            print(f"Assistant: {reply}")
 
                 except r.exceptions.RequestException as e:
                     print(f"Could not reach Ollama: {e}")
@@ -337,7 +431,7 @@ def warm_model():
         "model": MODEL,
         "prompt": "Hello, world!",
         "stream": False,
-        "thinking": False
+        "think": False,
         })
 
         if response.status_code == 200:

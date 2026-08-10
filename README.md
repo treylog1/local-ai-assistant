@@ -2,6 +2,8 @@
 
 A Windows CLI assistant that runs fully locally with [Ollama](https://ollama.com). Chat with a small local model and let it use tools to create, read, write, rename, and delete files on your machine.
 
+![Local AI Assistant demo](Animation.gif)
+
 ## Features
 
 - Local inference through Ollama (no cloud API keys)
@@ -9,6 +11,7 @@ A Windows CLI assistant that runs fully locally with [Ollama](https://ollama.com
 - Interactive menu to start/stop Ollama, check status, and chat
 - Startup checks that Ollama and the required model are available
 - Confirmation prompt before any file delete
+- Clean replies (model thinking is kept out of the chat UI)
 
 ## Requirements
 
@@ -60,6 +63,7 @@ Deleting a file always asks for confirmation first.
 
 ```
 Local-AI-assistant/
+├── Animation.gif      # Demo of the CLI
 ├── main.py            # Menu, Ollama lifecycle, chat + tool loop
 ├── tools.py           # File tools (create, read, write, rename, delete)
 ├── main.bat           # Windows launcher
